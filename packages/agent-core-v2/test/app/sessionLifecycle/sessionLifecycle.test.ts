@@ -45,10 +45,10 @@ import { ISessionIndex, type SessionSummary } from '#/app/sessionIndex/sessionIn
 import { IAppendLogStore } from '#/persistence/interface/appendLogStore';
 import { IAtomicDocumentStore } from '#/persistence/interface/atomicDocumentStore';
 import { JsonAtomicDocumentStore } from '#/persistence/backends/node-fs/atomicDocumentStore';
-import { IWriteAuthorityRegistry } from '#/persistence/interface/writeAuthority';
+import { ISessionWriteGate, IWriteGateRegistry } from '#/persistence/interface/writeGate';
 import { AppendLogStore } from '#/persistence/backends/node-fs/appendLogStore';
 import { FileStorageService } from '#/persistence/backends/node-fs/fileStorageService';
-import { WriteAuthorityRegistryService } from '#/persistence/backends/node-fs/writeAuthorityRegistryService';
+import { WriteGateRegistryService } from '#/persistence/backends/node-fs/writeGateRegistryService';
 import { IWorkspaceLocalConfigService } from '#/app/workspaceLocalConfig/workspaceLocalConfig';
 import { ISessionWorkspaceContext } from '#/session/workspaceContext/workspaceContext';
 import { SessionWorkspaceContextService } from '#/session/workspaceContext/workspaceContextService';
@@ -515,7 +515,7 @@ describe('SessionLifecycleService', () => {
       stubPair(ILogService, stubLog()),
       stubPair(IFlagService, stubFlag(false)),
       stubPair(ICrossProcessLockService, stubCrossProcessLock()),
-      stubPair(IWriteAuthorityRegistry, new WriteAuthorityRegistryService()),
+      stubPair(IWriteGateRegistry, new WriteGateRegistryService()),
       stubPair(ISessionLeaseContactProvider, new SessionLeaseContactProvider()),
       ...extra,
     ]);
@@ -1018,6 +1018,21 @@ describe('SessionLifecycleService', () => {
     expect(closed).toEqual(['s1']);
   });
 
+  it('logs and continues when a release hook fails', async () => {
+    const svc = build();
+    const closed: string[] = [];
+    svc.onDidCloseSession((e) => closed.push(e.sessionId));
+    svc.hooks.onWillReleaseSession.register('failing-hook', async () => {
+      throw new Error('hook failed');
+    });
+    await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+
+    await expect(svc.close('s1')).resolves.toBeUndefined();
+
+    expect(closed).toEqual(['s1']);
+    expect(svc.get('s1')).toBeUndefined();
+  });
+
   it('fires onDidArchiveSession when a session is archived', async () => {
     const svc = build([
       stubPair(IAgentLifecycleService, {
@@ -1358,7 +1373,7 @@ describe('SessionLifecycleService', () => {
       return [
         stubPair(IBootstrapService, tmpBootstrapStub(root)),
         stubPair(ICrossProcessLockService, new CrossProcessLockService()),
-        stubPair(IWriteAuthorityRegistry, new WriteAuthorityRegistryService()),
+        stubPair(IWriteGateRegistry, new WriteGateRegistryService()),
         ...over,
       ];
     }
@@ -1366,20 +1381,20 @@ describe('SessionLifecycleService', () => {
     function realAlsSeeds(root: string): {
       seeds: ReturnType<typeof stubPair>[];
       appendLog: AppendLogStore;
-      registry: WriteAuthorityRegistryService;
+      registry: WriteGateRegistryService;
       storage: FileStorageService;
       docs: JsonAtomicDocumentStore;
     } {
-      const registry = new WriteAuthorityRegistryService();
+      const registry = new WriteGateRegistryService();
       const locks = new CrossProcessLockService();
-      const storage = new FileStorageService(root, undefined, undefined, locks);
-      const appendLog = new AppendLogStore(storage, registry);
+      const storage = new FileStorageService(root, undefined, undefined, locks, registry);
+      const appendLog = new AppendLogStore(storage);
       const docs = new JsonAtomicDocumentStore(storage);
       return {
         seeds: [
           stubPair(IBootstrapService, tmpBootstrapStub(root)),
           stubPair(ICrossProcessLockService, locks),
-          stubPair(IWriteAuthorityRegistry, registry),
+          stubPair(IWriteGateRegistry, registry),
           stubPair(IAppendLogStore, appendLog),
           stubPair(IAtomicDocumentStore, docs),
         ],
@@ -1558,27 +1573,49 @@ describe('SessionLifecycleService', () => {
       await expectLeaseFree(root, 's1');
     });
 
-    it('keeps authority and lease when the session durability barrier fails', async () => {
+    it('seals new writes and waits for an admitted write before releasing the lease', async () => {
       const root = await makeTmpRoot();
-      const { seeds, appendLog, registry, storage } = realAlsSeeds(root);
-      const svc = build(seeds);
-      await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
-      const failure = new Error('durable append failed');
-      poisonSessionAppend(storage, 's1', failure);
-      appendLog.append('sessions/wd_stub/s1/agents/main', 'wire.jsonl', { tail: true });
+      const svc = build(realInstanceSeeds(root));
+      const handle = await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+      const writeGate = handle.accessor.get(ISessionWriteGate);
+      let finishWrite!: () => void;
+      const writeBlocked = new Promise<void>((resolve) => {
+        finishWrite = resolve;
+      });
+      let enterWrite!: () => void;
+      const writeEntered = new Promise<void>((resolve) => {
+        enterWrite = resolve;
+      });
+      const write = writeGate.run(async () => {
+        enterWrite();
+        await writeBlocked;
+      });
+      await writeEntered;
 
-      await expect(svc.close('s1')).rejects.toBe(failure);
-      expect(svc.get('s1')).toBeUndefined();
-      expect(registry.resolve('s1')).toBeDefined();
-      await expect(stat(leaseFile(root, 's1'))).resolves.toBeDefined();
-      await expect(
-        new CrossProcessLockService().acquire(leaseFile(root, 's1')),
-      ).rejects.toMatchObject({ code: CrossProcessLockErrorCode.Held });
-      await expect(svc.close('s1')).rejects.toBe(failure);
-      expect(registry.resolve('s1')).toBeDefined();
+      let closeSettled = false;
+      const closing = svc.close('s1').finally(() => {
+        closeSettled = true;
+      });
+      let sealed = false;
+      for (let attempt = 0; attempt < 10 && !sealed; attempt++) {
+        try {
+          await writeGate.run(async () => {});
+        } catch (error) {
+          expect(error).toMatchObject({ code: ErrorCodes.SESSION_LEASE_LOST });
+          sealed = true;
+        }
+        if (!sealed) await tick();
+      }
+
+      expect(sealed).toBe(true);
+      expect(closeSettled).toBe(false);
+      finishWrite();
+      await write;
+      await closing;
+      await expectLeaseFree(root, 's1');
     });
 
-    it('requires an explicit dirty abort before releasing a failed durability lease', async () => {
+    it('abandons and releases the lease when the session durability barrier fails', async () => {
       const root = await makeTmpRoot();
       const { seeds, appendLog, registry, storage, docs } = realAlsSeeds(root);
       const svc = build(seeds);
@@ -1588,10 +1625,38 @@ describe('SessionLifecycleService', () => {
       poisonSessionAppend(storage, 's1', failure);
       appendLog.append('sessions/wd_stub/s1/agents/main', 'wire.jsonl', { tail: true });
 
-      await expect(svc.close('s1')).rejects.toBe(failure);
-      await svc.forceAbort('s1');
+      await expect(svc.close('s1')).rejects.toMatchObject({
+        code: ErrorCodes.SESSION_DURABILITY_FAILED,
+        cause: failure,
+        details: { sessionId: 's1', stage: 'flush' },
+      });
+      expect(svc.get('s1')).toBeUndefined();
+      await expect(
+        registry.run('sessions/wd_stub/s1/agents/main', async () => {}),
+      ).rejects.toMatchObject({ code: ErrorCodes.SESSION_LEASE_LOST });
+      expect(await docs.get<{ custom?: { dirtyAbort?: { reason?: string } } }>(
+        'sessions/wd_stub/s1',
+        'state.json',
+      )).toMatchObject({ custom: { dirtyAbort: { reason: 'flush-failed' } } });
+      await expectLeaseReleased(root, 's1');
+      await expectLeaseFree(root, 's1');
+      await expect(svc.close('s1')).resolves.toBeUndefined();
+    });
 
-      expect(registry.resolve('s1')).toBeUndefined();
+    it('reports an automatic dirty abort after a durability failure', async () => {
+      const root = await makeTmpRoot();
+      const { seeds, appendLog, storage } = realAlsSeeds(root);
+      const svc = build(seeds);
+      await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
+      const failure = new Error('durable append failed');
+      poisonSessionAppend(storage, 's1', failure);
+      appendLog.append('sessions/wd_stub/s1/agents/main', 'wire.jsonl', { tail: true });
+
+      await expect(svc.close('s1')).rejects.toMatchObject({
+        code: ErrorCodes.SESSION_DURABILITY_FAILED,
+        cause: failure,
+      });
+
       await expectLeaseReleased(root, 's1');
       await expectLeaseFree(root, 's1');
       expect(telemetryRecords).toContainEqual({
@@ -1611,7 +1676,9 @@ describe('SessionLifecycleService', () => {
 
       await svc.closeAll();
 
-      expect(registry.resolve('s1')).toBeUndefined();
+      await expect(
+        registry.run('sessions/wd_stub/s1', async () => {}),
+      ).rejects.toMatchObject({ code: ErrorCodes.SESSION_LEASE_LOST });
       expect(await docs.get<{ custom?: { dirtyAbort?: { reason?: string } } }>(
         'sessions/wd_stub/s1',
         'state.json',
@@ -1619,24 +1686,17 @@ describe('SessionLifecycleService', () => {
       await expectLeaseFree(root, 's1');
     });
 
-    it('includes an already flush-failed session when closeAll drains materialized entries', async () => {
+    it('shares one release when close and closeAll overlap', async () => {
       const root = await makeTmpRoot();
-      const { seeds, appendLog, registry, storage, docs } = realAlsSeeds(root);
+      const { seeds, registry } = realAlsSeeds(root);
       const svc = build(seeds);
       await svc.create({ sessionId: 's1', workDir: '/tmp/proj' });
-      await writeStateDoc(docs, 's1');
-      const failure = new Error('durable append failed');
-      poisonSessionAppend(storage, 's1', failure);
-      appendLog.append('sessions/wd_stub/s1/agents/main', 'wire.jsonl', { tail: true });
-      await expect(svc.close('s1')).rejects.toBe(failure);
 
-      await svc.closeAll();
+      await Promise.all([svc.close('s1'), svc.closeAll()]);
 
-      expect(registry.resolve('s1')).toBeUndefined();
-      expect(await docs.get<{ custom?: { dirtyAbort?: { reason?: string } } }>(
-        'sessions/wd_stub/s1',
-        'state.json',
-      )).toMatchObject({ custom: { dirtyAbort: { reason: 'flush-failed' } } });
+      await expect(
+        registry.run('sessions/wd_stub/s1', async () => {}),
+      ).rejects.toMatchObject({ code: ErrorCodes.SESSION_LEASE_LOST });
       await expectLeaseFree(root, 's1');
     });
 
